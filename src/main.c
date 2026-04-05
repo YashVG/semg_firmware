@@ -33,12 +33,12 @@
  *   [0..1]   uint16  sequence number
  *   [2..5]   uint32  timestamp (ms since boot)
  *   [6]      uint8   sample count  (29)
- *   [7]      uint8   channel mask  (0x0F)
- *   [8..239] int16   sample data   (29 samples x 4 channels)
+ *   [7]      uint8   channel mask  (0x07)
+ *   [8..239] int16   sample data   (29 samples x 3 channels)
  */
 #define SEMG_SAMPLE_COUNT   29
-#define SEMG_CHANNEL_COUNT  4
-#define SEMG_CHANNEL_MASK   0x0F
+#define SEMG_CHANNEL_COUNT  3
+#define SEMG_CHANNEL_MASK   0x07
 #define SEMG_HEADER_SIZE    8
 #define SEMG_DATA_SIZE      (SEMG_SAMPLE_COUNT * SEMG_CHANNEL_COUNT * 2) /* 232 */
 #define SEMG_PACKET_SIZE    (SEMG_HEADER_SIZE + SEMG_DATA_SIZE)          /* 240 */
