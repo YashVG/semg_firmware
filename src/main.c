@@ -103,6 +103,22 @@ enum
 
 static ATOMIC_DEFINE(state, STATE_BITS);
 
+static struct bt_conn *current_conn;
+static struct bt_gatt_exchange_params mtu_exchange_params;
+
+static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
+							struct bt_gatt_exchange_params *params)
+{
+	if (err)
+	{
+		printk("MTU exchange failed (err %u)\n", err);
+	}
+	else
+	{
+		printk("MTU exchanged: %u\n", bt_gatt_get_mtu(conn));
+	}
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err)
@@ -112,11 +128,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 
 	printk("Connected\n");
+	current_conn = bt_conn_ref(conn);
 	(void)atomic_set_bit(state, STATE_CONNECTED);
 
 	struct bt_le_conn_param param = {
-		.interval_min = 8, /* 8 × 1.25ms = 10ms */
-		.interval_max = 8,
+		.interval_min = 6, /* 6 × 1.25ms = 7.5ms */
+		.interval_max = 8, /* 8 × 1.25ms = 10ms  */
 		.latency = 0,
 		.timeout = 400, /* 4s supervision timeout */
 	};
@@ -126,11 +143,24 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	{
 		printk("Connection param update failed (err %d)\n", cerr);
 	}
+
+	mtu_exchange_params.func = mtu_exchange_cb;
+	int merr = bt_gatt_exchange_mtu(conn, &mtu_exchange_params);
+	if (merr)
+	{
+		printk("MTU exchange request failed (err %d)\n", merr);
+	}
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	printk("Disconnected, reason 0x%02x %s\n", reason, bt_hci_err_to_str(reason));
+
+	if (current_conn)
+	{
+		bt_conn_unref(current_conn);
+		current_conn = NULL;
+	}
 
 	(void)atomic_set_bit(state, STATE_DISCONNECTED);
 }
@@ -154,20 +184,6 @@ static struct bt_conn_auth_cb auth_cb_display = {
 };
 
 /* ── Notifications ────────────────────────────────────────────── */
-
-static void bas_notify(void)
-{
-	uint8_t battery_level = bt_bas_get_battery_level();
-
-	battery_level--;
-
-	if (!battery_level)
-	{
-		battery_level = 100U;
-	}
-
-	bt_bas_set_battery_level(battery_level);
-}
 
 /* Timer ISR (2000 Hz): generates one fake sample per tick */
 static void sample_timer_handler(struct k_timer *timer)
@@ -223,7 +239,10 @@ static void semg_send_handler(struct k_work *work)
 		sys_put_le16((uint16_t)src[i], &buf[SEMG_HEADER_SIZE + i * 2]);
 	}
 
-	bt_gatt_notify(NULL, &semg_svc.attrs[1], buf, sizeof(buf));
+	if (current_conn)
+	{
+		bt_gatt_notify(current_conn, &semg_svc.attrs[1], buf, sizeof(buf));
+	}
 
 	/* Expected interval: 14 ms (29 samples / 2000 Hz = 14.5 ms) */
 	if (last_send_ts != 0)
@@ -397,9 +416,6 @@ int main(void)
 	while (1)
 	{
 		k_sleep(K_SECONDS(1));
-
-		/* Battery level simulation */
-		bas_notify();
 
 		if (atomic_test_and_clear_bit(state, STATE_CONNECTED))
 		{
