@@ -1,7 +1,7 @@
 # sEMG BLE Firmware
 
-Zephyr RTOS firmware for the nRF5340 DK that samples 4-channel sEMG data at
-2000 Hz and streams it over BLE as 240-byte notification packets.
+Zephyr RTOS firmware for the nRF5340 DK that samples 3-channel sEMG data at
+2000 Hz and streams it over BLE as 182-byte notification packets.
 
 Currently uses **fake (incrementing) sample data** in place of a real ADC
 driver. The data path, timing, packet format, and BLE plumbing are all
@@ -31,7 +31,7 @@ characteristic, the real-time data path kicks in:
 ```
 k_timer ISR  (every 500 us)
  |
- |  write 4 x int16 fake sample into sample_bufs[active_buf]
+ |  write 3 x int16 fake sample into sample_bufs[active_buf]
  |  increment sample_idx
  |
  |  sample_idx == 29?
@@ -41,7 +41,7 @@ k_timer ISR  (every 500 us)
  v
 system workqueue thread  (semg_send_handler)
  |
- |  pack 240-byte packet (header + 29 samples)
+ |  pack 182-byte packet (header + 29 samples x 3 channels)
  |  bt_gatt_notify() ──> over-the-air to central
  |  print "sEMG pkt #N  dt=XX ms (expect ~14)"
 ```
@@ -56,9 +56,9 @@ system workqueue thread  (semg_send_handler)
 The timer ISR only does array writes and a `k_work_submit` (both ISR-safe).
 The actual BLE call happens later in thread context on the system workqueue.
 
-## Packet format (240 bytes)
+## Packet format (182 bytes)
 
-Every packet carries exactly 29 samples from 4 channels:
+Every packet carries exactly 29 samples from 3 channels:
 
 ```
 Offset  Size   Type     Field
@@ -66,13 +66,13 @@ Offset  Size   Type     Field
 0       2      uint16   sequence number (LE)
 2       4      uint32   timestamp in ms since boot (LE)
 6       1      uint8    sample count (always 29)
-7       1      uint8    channel mask  (0x0F = ch 0-3)
-8       232    int16[]  sample data: 29 samples x 4 channels (LE)
+7       1      uint8    channel mask  (0x07 = ch 0-2)
+8       174    int16[]  sample data: 29 samples x 3 channels (LE)
 ------  -----
-Total:  240 bytes
+Total:  182 bytes
 ```
 
-Samples are laid out as `[s0_ch0, s0_ch1, s0_ch2, s0_ch3, s1_ch0, ...]`
+Samples are laid out as `[s0_ch0, s0_ch1, s0_ch2, s1_ch0, s1_ch1, s1_ch2, ...]`
 in little-endian int16.
 
 At 2000 samples/sec with 29 samples per packet, a new packet is sent
@@ -129,14 +129,15 @@ semg_firmware/
 
 | Setting | Value | Why |
 |---|---|---|
-| `CONFIG_BT_L2CAP_TX_MTU` | 247 | ATT MTU must be >= 243 (240 payload + 3 header) |
+| `CONFIG_BT_L2CAP_TX_MTU` | 247 | ATT MTU sized with headroom for the 182-byte payload (185 with ATT header) |
 | `CONFIG_BT_BUF_ACL_TX_SIZE` | 251 | L2CAP frame = MTU + 4 byte L2CAP header |
 | `CONFIG_BT_BUF_ACL_RX_SIZE` | 251 | Symmetric with TX for MTU exchange |
+| `CONFIG_BT_GATT_CLIENT` | y | Lets the peripheral initiate `bt_gatt_exchange_mtu()` |
 | `CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE` | 2048 | `bt_gatt_notify` call chain needs headroom |
 | `CONFIG_BT_SMP` | y | Security Manager Protocol (pairing support) |
 
-The central **must** request an ATT MTU of at least 243 during the MTU
-exchange, or the 240-byte notification will fail. Most modern BLE centrals
+The central **must** request an ATT MTU of at least 185 during the MTU
+exchange, or the 182-byte notification will fail. Most modern BLE centrals
 (phones, nRF Connect, etc.) request 247+ automatically.
 
 ## Building and flashing
@@ -163,7 +164,7 @@ Advertising successfully started
 2. The app will auto-negotiate MTU (verify it's >= 243 in the connection info).
 3. Find the **Unknown Service** with UUID `00001800-b5a3-f393-...`.
 4. Tap the triple-down-arrow on the characteristic to enable notifications.
-5. You should see 240-byte payloads arriving every ~14-15 ms.
+5. You should see 182-byte payloads arriving every ~14-15 ms.
 6. On the serial console you'll see timing logs:
    ```
    sEMG pkt #1  dt=15 ms (expect ~14)
@@ -172,7 +173,7 @@ Advertising successfully started
 
 ## Where to plug in real ADC data
 
-Replace the body of `sample_timer_handler()` (line 158). Currently it does:
+Replace the body of `sample_timer_handler()` (`src/main.c:189`). Currently it does:
 
 ```c
 for (int ch = 0; ch < SEMG_CHANNEL_COUNT; ch++) {
