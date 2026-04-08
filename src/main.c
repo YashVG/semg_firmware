@@ -241,7 +241,15 @@ static void semg_send_handler(struct k_work *work)
 
 	if (current_conn)
 	{
-		bt_gatt_notify(current_conn, &semg_svc.attrs[1], buf, sizeof(buf));
+		printk("notifying via conn %p\n", current_conn);
+		int err = bt_gatt_notify(current_conn, &semg_svc.attrs[1], buf, sizeof(buf));
+		if (err) {
+			printk("bt_gatt_notify failed: %d\n", err);
+		}
+	}
+	else
+	{
+		printk("current_conn is NULL — skipping notify\n");
 	}
 
 	/* Expected interval: 14 ms (29 samples / 2000 Hz = 14.5 ms) */
