@@ -9,7 +9,10 @@
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/util.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -17,6 +20,10 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/services/bas.h>
+
+#if defined(CONFIG_GPIO)
+#include <zephyr/drivers/gpio.h>
+#endif
 
 /* ── Custom sEMG Service ──────────────────────────────────────── */
 
@@ -34,14 +41,27 @@
  *   [2..5]   uint32  timestamp (ms since boot)
  *   [6]      uint8   sample count  (29)
  *   [7]      uint8   channel mask  (0x07)
- *   [8..239] int16   sample data   (29 samples x 3 channels)
+ *   [8..181] int16   sample data   (29 samples x 3 channels)
  */
 #define SEMG_SAMPLE_COUNT 29
 #define SEMG_CHANNEL_COUNT 3
 #define SEMG_CHANNEL_MASK 0x07
 #define SEMG_HEADER_SIZE 8
-#define SEMG_DATA_SIZE (SEMG_SAMPLE_COUNT * SEMG_CHANNEL_COUNT * 2) /* 232 */
-#define SEMG_PACKET_SIZE (SEMG_HEADER_SIZE + SEMG_DATA_SIZE)		/* 240 */
+#define SEMG_DATA_SIZE (SEMG_SAMPLE_COUNT * SEMG_CHANNEL_COUNT * 2) /* 174 */
+#define SEMG_PACKET_SIZE (SEMG_HEADER_SIZE + SEMG_DATA_SIZE)		/* 182 */
+
+#define SEMG_SAMPLE_RATE_HZ 2000
+#define SIM_ENV_MAX 1024
+#define SIM_REST_ENV 42
+#define SIM_LIFT_ATTACK_STEP 1		/* ~1.0s from rest to full contraction */
+#define SIM_FAST_LOWER_STEP 13		/* ~0.8s from full contraction to rest */
+#define SIM_BRAKED_LOWER_STEP 5		/* ~2.0s from full contraction to rest */
+#define SIM_TOP_HOLD_TICKS (SEMG_SAMPLE_RATE_HZ / 2)
+#define SIM_FATIGUE_MAX 768
+#define SIM_SIGNAL_GAIN_Q10 3072 /* 3.0x */
+#define SIM_OUTPUT_LIMIT 22000
+#define SIM_BUTTON_DEBOUNCE_MS 25
+#define SEMG_PACKET_LOG_INTERVAL 64
 
 static bool semg_ntf_enabled;
 static uint16_t semg_seq;
@@ -51,11 +71,169 @@ static int16_t sample_bufs[2][SEMG_SAMPLE_COUNT * SEMG_CHANNEL_COUNT];
 static uint8_t active_buf;	  /* buffer index the timer ISR fills   */
 static uint8_t ready_buf;	  /* buffer index the work handler reads */
 static uint8_t sample_idx;	  /* next sample slot in active buffer   */
-static int16_t fake_sample;	  /* incrementing fake ADC value         */
 static atomic_t send_pending; /* guards ready_buf during BLE send   */
 
 static struct k_work semg_send_work;
 static struct k_timer sample_timer;
+
+static atomic_t lift_button_pressed;
+static atomic_t brake_button_pressed;
+
+struct sim_state {
+	uint16_t envelope;
+	uint16_t hold_ticks;
+	uint16_t fatigue;
+	uint8_t fatigue_div;
+	uint8_t recovery_div;
+	uint32_t prng;
+	uint16_t phase_low;
+	uint16_t phase_mid;
+	uint16_t phase_high;
+	bool was_lifting;
+};
+
+static struct sim_state sim = {
+	.envelope = SIM_REST_ENV,
+	.prng = 0x1f2e3d4c,
+};
+
+static int16_t clamp_sim_sample(int32_t value)
+{
+	if (value > SIM_OUTPUT_LIMIT)
+	{
+		return SIM_OUTPUT_LIMIT;
+	}
+	if (value < -SIM_OUTPUT_LIMIT)
+	{
+		return -SIM_OUTPUT_LIMIT;
+	}
+	return (int16_t)value;
+}
+
+static int32_t tri_wave_q10(uint16_t phase)
+{
+	uint16_t folded = (phase & 0x8000) ? (uint16_t)(0xffff - phase) : phase;
+
+	return ((int32_t)(folded >> 4)) - 1024;
+}
+
+static int32_t next_noise_q10(void)
+{
+	uint32_t x = sim.prng;
+
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	sim.prng = x;
+
+	return (int32_t)((x >> 22) & 0x3ff) - 512;
+}
+
+static void sim_update_movement(void)
+{
+	bool lifting = atomic_get(&lift_button_pressed) != 0;
+	bool braking = atomic_get(&brake_button_pressed) != 0;
+
+	if (lifting)
+	{
+		sim.was_lifting = true;
+
+		if (sim.envelope < SIM_ENV_MAX)
+		{
+			uint16_t next = sim.envelope + SIM_LIFT_ATTACK_STEP;
+			sim.envelope = (next > SIM_ENV_MAX) ? SIM_ENV_MAX : next;
+		}
+
+		if (sim.envelope >= (SIM_ENV_MAX - 12))
+		{
+			if (sim.hold_ticks < UINT16_MAX)
+			{
+				sim.hold_ticks++;
+			}
+
+			if (sim.hold_ticks > SIM_TOP_HOLD_TICKS)
+			{
+				sim.fatigue_div++;
+				if (sim.fatigue_div >= 8)
+				{
+					sim.fatigue_div = 0;
+					if (sim.fatigue < SIM_FATIGUE_MAX)
+					{
+						sim.fatigue++;
+					}
+				}
+			}
+		}
+		else
+		{
+			sim.hold_ticks = 0;
+			sim.fatigue_div = 0;
+		}
+	}
+	else
+	{
+		uint16_t lower_step = braking ? SIM_BRAKED_LOWER_STEP : SIM_FAST_LOWER_STEP;
+
+		sim.hold_ticks = 0;
+		sim.fatigue_div = 0;
+
+		if (sim.envelope > SIM_REST_ENV)
+		{
+			uint16_t next = sim.envelope - MIN(sim.envelope - SIM_REST_ENV, lower_step);
+			sim.envelope = next;
+		}
+		else
+		{
+			sim.envelope = SIM_REST_ENV;
+			sim.was_lifting = false;
+		}
+
+		if (sim.fatigue > 0)
+		{
+			sim.recovery_div++;
+			if (sim.recovery_div >= 12)
+			{
+				sim.recovery_div = 0;
+				sim.fatigue--;
+			}
+		}
+	}
+
+	sim.phase_low += 1278;  /* ~39 Hz at 2000 SPS */
+	sim.phase_mid += 2687;  /* ~82 Hz at 2000 SPS */
+	sim.phase_high += 4489; /* ~137 Hz at 2000 SPS */
+}
+
+static int16_t sim_generate_channel_sample(uint8_t channel)
+{
+	static const uint16_t channel_gain_q10[SEMG_CHANNEL_COUNT] = {1024, 740, 560};
+	static const uint16_t channel_phase_offset[SEMG_CHANNEL_COUNT] = {0, 0x1555, 0x2aaa};
+	uint16_t offset = channel_phase_offset[channel];
+	int32_t fatigue = sim.fatigue;
+	int32_t low = tri_wave_q10(sim.phase_low + offset);
+	int32_t mid = tri_wave_q10(sim.phase_mid + (offset >> 1));
+	int32_t high = tri_wave_q10(sim.phase_high + (offset << 1));
+	int32_t noise = next_noise_q10();
+	int32_t low_weight = 520 + (fatigue >> 2);
+	int32_t mid_weight = 680;
+	int32_t high_weight = 560 - (fatigue >> 1);
+	int32_t mixed;
+	int32_t scaled;
+
+	if (high_weight < 150)
+	{
+		high_weight = 150;
+	}
+
+	mixed = (low * low_weight) + (mid * mid_weight) + (high * high_weight) + (noise * 220);
+	mixed >>= 8;
+
+	scaled = (mixed * (int32_t)sim.envelope) >> 10;
+	scaled = (scaled * (int32_t)channel_gain_q10[channel]) >> 10;
+	scaled = (scaled * SIM_SIGNAL_GAIN_Q10) >> 10;
+
+	return clamp_sim_sample(scaled);
+}
 
 static void semg_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
@@ -185,14 +363,16 @@ static struct bt_conn_auth_cb auth_cb_display = {
 
 /* ── Notifications ────────────────────────────────────────────── */
 
-/* Timer ISR (2000 Hz): generates one fake sample per tick */
+/* Timer ISR (2000 Hz): generates one simulated bicep sample per tick */
 static void sample_timer_handler(struct k_timer *timer)
 {
 	int16_t *dst = &sample_bufs[active_buf][sample_idx * SEMG_CHANNEL_COUNT];
 
+	sim_update_movement();
+
 	for (int ch = 0; ch < SEMG_CHANNEL_COUNT; ch++)
 	{
-		dst[ch] = fake_sample++;
+		dst[ch] = sim_generate_channel_sample((uint8_t)ch);
 	}
 
 	sample_idx++;
@@ -229,7 +409,9 @@ static void semg_send_handler(struct k_work *work)
 	uint32_t now = k_uptime_get_32();
 	uint32_t delta = now - last_send_ts;
 
-	sys_put_le16(semg_seq++, &buf[0]);
+	uint16_t packet_seq = semg_seq++;
+
+	sys_put_le16(packet_seq, &buf[0]);
 	sys_put_le32(now, &buf[2]);
 	buf[6] = SEMG_SAMPLE_COUNT;
 	buf[7] = SEMG_CHANNEL_MASK;
@@ -241,7 +423,6 @@ static void semg_send_handler(struct k_work *work)
 
 	if (current_conn)
 	{
-		printk("notifying via conn %p\n", current_conn);
 		int err = bt_gatt_notify(current_conn, &semg_svc.attrs[1], buf, sizeof(buf));
 		if (err) {
 			printk("bt_gatt_notify failed: %d\n", err);
@@ -253,15 +434,182 @@ static void semg_send_handler(struct k_work *work)
 	}
 
 	/* Expected interval: 14 ms (29 samples / 2000 Hz = 14.5 ms) */
-	if (last_send_ts != 0)
+	if ((last_send_ts != 0) && ((packet_seq % SEMG_PACKET_LOG_INTERVAL) == 0))
 	{
 		printk("sEMG pkt #%u  dt=%u ms (expect ~14)\n",
-			   (unsigned int)(semg_seq - 1), delta);
+			   (unsigned int)packet_seq, delta);
 	}
 	last_send_ts = now;
 
 	atomic_set(&send_pending, 0);
 }
+
+/* ── Sim movement buttons ─────────────────────────────────────── */
+
+#if defined(CONFIG_GPIO)
+#define SW1_NODE DT_ALIAS(sw0)
+#define SW2_NODE DT_ALIAS(sw1)
+
+#if DT_NODE_HAS_STATUS_OKAY(SW1_NODE) && DT_NODE_HAS_STATUS_OKAY(SW2_NODE)
+#define HAS_SIM_BUTTONS 1
+
+static const struct gpio_dt_spec lift_button = GPIO_DT_SPEC_GET(SW1_NODE, gpios);
+static const struct gpio_dt_spec brake_button = GPIO_DT_SPEC_GET(SW2_NODE, gpios);
+static struct gpio_callback lift_button_cb;
+static struct gpio_callback brake_button_cb;
+static struct k_work sim_button_log_work;
+static struct k_work_delayable sim_button_debounce_work;
+static int lift_button_logged_state = -1;
+static int brake_button_logged_state = -1;
+
+static void sim_button_log_handler(struct k_work *work)
+{
+	(void)work;
+
+	int lift = atomic_get(&lift_button_pressed) != 0;
+	int brake = atomic_get(&brake_button_pressed) != 0;
+	bool changed = false;
+
+	if (lift != lift_button_logged_state)
+	{
+		printk("SIM BTN SW1 lift/curl %s  t=%u ms\n",
+			   lift ? "pressed" : "released",
+			   k_uptime_get_32());
+		lift_button_logged_state = lift;
+		changed = true;
+	}
+
+	if (brake != brake_button_logged_state)
+	{
+		printk("SIM BTN SW2 controlled-lowering %s  t=%u ms\n",
+			   brake ? "pressed" : "released",
+			   k_uptime_get_32());
+		brake_button_logged_state = brake;
+		changed = true;
+	}
+
+	if (changed)
+	{
+		printk("SIM BTN state: lift=%d brake=%d\n", lift, brake);
+	}
+}
+
+static bool sim_buttons_update(void)
+{
+	int lift = gpio_pin_get_dt(&lift_button);
+	int brake = gpio_pin_get_dt(&brake_button);
+	bool changed = false;
+
+	if (lift >= 0)
+	{
+		int pressed = lift ? 1 : 0;
+
+		if (atomic_get(&lift_button_pressed) != pressed)
+		{
+			atomic_set(&lift_button_pressed, pressed);
+			changed = true;
+		}
+	}
+	if (brake >= 0)
+	{
+		int pressed = brake ? 1 : 0;
+
+		if (atomic_get(&brake_button_pressed) != pressed)
+		{
+			atomic_set(&brake_button_pressed, pressed);
+			changed = true;
+		}
+	}
+
+	return changed;
+}
+
+static void sim_button_debounce_handler(struct k_work *work)
+{
+	(void)work;
+
+	if (sim_buttons_update())
+	{
+		k_work_submit(&sim_button_log_work);
+	}
+}
+
+static void sim_button_changed(const struct device *dev,
+							   struct gpio_callback *cb,
+							   uint32_t pins)
+{
+	(void)dev;
+	(void)cb;
+	(void)pins;
+
+	k_work_reschedule(&sim_button_debounce_work, K_MSEC(SIM_BUTTON_DEBOUNCE_MS));
+}
+
+static int sim_buttons_setup(void)
+{
+	int err;
+
+	if (!gpio_is_ready_dt(&lift_button) || !gpio_is_ready_dt(&brake_button))
+	{
+		printk("Simulation buttons are not ready\n");
+		return -ENODEV;
+	}
+
+	k_work_init(&sim_button_log_work, sim_button_log_handler);
+	k_work_init_delayable(&sim_button_debounce_work, sim_button_debounce_handler);
+
+	err = gpio_pin_configure_dt(&lift_button, GPIO_INPUT);
+	if (err)
+	{
+		printk("Failed to configure SW1 lift button (err %d)\n", err);
+		return err;
+	}
+
+	err = gpio_pin_configure_dt(&brake_button, GPIO_INPUT);
+	if (err)
+	{
+		printk("Failed to configure SW2 brake button (err %d)\n", err);
+		return err;
+	}
+
+	gpio_init_callback(&lift_button_cb, sim_button_changed, BIT(lift_button.pin));
+	err = gpio_add_callback(lift_button.port, &lift_button_cb);
+	if (err)
+	{
+		printk("Failed to add SW1 lift callback (err %d)\n", err);
+		return err;
+	}
+
+	gpio_init_callback(&brake_button_cb, sim_button_changed, BIT(brake_button.pin));
+	err = gpio_add_callback(brake_button.port, &brake_button_cb);
+	if (err)
+	{
+		printk("Failed to add SW2 brake callback (err %d)\n", err);
+		return err;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&lift_button, GPIO_INT_EDGE_BOTH);
+	if (err)
+	{
+		printk("Failed to enable SW1 lift interrupt (err %d)\n", err);
+		return err;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&brake_button, GPIO_INT_EDGE_BOTH);
+	if (err)
+	{
+		printk("Failed to enable SW2 brake interrupt (err %d)\n", err);
+		return err;
+	}
+
+	sim_buttons_update();
+	k_work_submit(&sim_button_log_work);
+	printk("Simulation controls ready: SW1 lift/curl, SW2 controlled lowering\n");
+
+	return 0;
+}
+#endif /* SW1_NODE && SW2_NODE */
+#endif /* CONFIG_GPIO */
 
 /* ── LED blink (optional) ─────────────────────────────────────── */
 
@@ -270,7 +618,6 @@ static void semg_send_handler(struct k_work *work)
 #define LED0_NODE DT_ALIAS(led0)
 
 #if DT_NODE_HAS_STATUS_OKAY(LED0_NODE)
-#include <zephyr/drivers/gpio.h>
 #define HAS_LED 1
 static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 #define BLINK_ONOFF K_MSEC(500)
@@ -352,6 +699,17 @@ int main(void)
 	bt_conn_auth_cb_register(&auth_cb_display);
 
 	k_work_init(&semg_send_work, semg_send_handler);
+
+#if defined(HAS_SIM_BUTTONS)
+	err = sim_buttons_setup();
+	if (err)
+	{
+		printk("Simulation buttons disabled (err %d)\n", err);
+	}
+#else
+	printk("Simulation buttons unavailable; streaming rest-noise simulation only\n");
+#endif /* HAS_SIM_BUTTONS */
+
 	k_timer_init(&sample_timer, sample_timer_handler, NULL);
 	k_timer_start(&sample_timer, K_USEC(500), K_USEC(500));
 
