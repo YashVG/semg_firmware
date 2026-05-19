@@ -62,6 +62,7 @@
 #define SIM_OUTPUT_LIMIT 22000
 #define SIM_BUTTON_DEBOUNCE_MS 25
 #define SEMG_PACKET_LOG_INTERVAL 64
+#define SEMG_REQUIRED_SECURITY BT_SECURITY_L2
 
 static bool semg_ntf_enabled;
 static uint16_t semg_seq;
@@ -235,6 +236,31 @@ static int16_t sim_generate_channel_sample(uint8_t channel)
 	return clamp_sim_sample(scaled);
 }
 
+static bool semg_connection_secure(const struct bt_conn *conn)
+{
+	return conn && (bt_conn_get_security(conn) >= SEMG_REQUIRED_SECURITY);
+}
+
+static ssize_t semg_ccc_write(struct bt_conn *conn,
+							  const struct bt_gatt_attr *attr,
+							  uint16_t value)
+{
+	(void)attr;
+
+	if ((value != 0) && (value != BT_GATT_CCC_NOTIFY))
+	{
+		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+	}
+
+	if ((value == BT_GATT_CCC_NOTIFY) && !semg_connection_secure(conn))
+	{
+		printk("Rejecting sEMG notification subscribe until BLE link is encrypted\n");
+		return BT_GATT_ERR(BT_ATT_ERR_INSUFFICIENT_ENCRYPTION);
+	}
+
+	return sizeof(value);
+}
+
 static void semg_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	semg_ntf_enabled = (value == BT_GATT_CCC_NOTIFY);
@@ -247,8 +273,10 @@ BT_GATT_SERVICE_DEFINE(semg_svc,
 											  BT_GATT_CHRC_NOTIFY,
 											  BT_GATT_PERM_NONE,
 											  NULL, NULL, NULL),
-					   BT_GATT_CCC(semg_ccc_changed,
-								   BT_GATT_PERM_READ | BT_GATT_PERM_WRITE), );
+						   BT_GATT_CCC_WITH_WRITE_CB(semg_ccc_changed,
+													 semg_ccc_write,
+													 BT_GATT_PERM_READ_ENCRYPT |
+														 BT_GATT_PERM_WRITE_ENCRYPT), );
 
 /* ── Advertising ──────────────────────────────────────────────── */
 
@@ -309,6 +337,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	current_conn = bt_conn_ref(conn);
 	(void)atomic_set_bit(state, STATE_CONNECTED);
 
+	int serr = bt_conn_set_security(conn, SEMG_REQUIRED_SECURITY);
+	if (serr)
+	{
+		printk("BLE security request failed (err %d)\n", serr);
+	}
+
 	struct bt_le_conn_param param = {
 		.interval_min = 6, /* 6 × 1.25ms = 7.5ms */
 		.interval_max = 8, /* 8 × 1.25ms = 10ms  */
@@ -333,6 +367,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	printk("Disconnected, reason 0x%02x %s\n", reason, bt_hci_err_to_str(reason));
+	semg_ntf_enabled = false;
 
 	if (current_conn)
 	{
@@ -343,9 +378,27 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	(void)atomic_set_bit(state, STATE_DISCONNECTED);
 }
 
+static void security_changed(struct bt_conn *conn, bt_security_t level,
+							 enum bt_security_err err)
+{
+	if (err)
+	{
+		semg_ntf_enabled = false;
+		printk("BLE security failed (level %u err %u)\n", level, err);
+		return;
+	}
+
+	printk("BLE security level changed: %u\n", level);
+	if (level < SEMG_REQUIRED_SECURITY)
+	{
+		semg_ntf_enabled = false;
+	}
+}
+
 BT_CONN_CB_DEFINE(conn_callbacks) = {
 	.connected = connected,
 	.disconnected = disconnected,
+	.security_changed = security_changed,
 };
 
 static void auth_cancel(struct bt_conn *conn)
@@ -399,6 +452,7 @@ static void semg_send_handler(struct k_work *work)
 	static uint8_t buf[SEMG_PACKET_SIZE];
 	static uint32_t last_send_ts;
 	int16_t *src = sample_bufs[ready_buf];
+	struct bt_conn *conn = current_conn;
 
 	if (!semg_ntf_enabled)
 	{
@@ -421,16 +475,31 @@ static void semg_send_handler(struct k_work *work)
 		sys_put_le16((uint16_t)src[i], &buf[SEMG_HEADER_SIZE + i * 2]);
 	}
 
-	if (current_conn)
+	if (conn)
 	{
-		int err = bt_gatt_notify(current_conn, &semg_svc.attrs[1], buf, sizeof(buf));
+		conn = bt_conn_ref(conn);
+	}
+
+	if (conn && semg_connection_secure(conn))
+	{
+		int err = bt_gatt_notify(conn, &semg_svc.attrs[1], buf, sizeof(buf));
 		if (err) {
 			printk("bt_gatt_notify failed: %d\n", err);
 		}
 	}
+	else if (conn)
+	{
+		semg_ntf_enabled = false;
+		printk("BLE link is not encrypted — disabling sEMG notifications\n");
+	}
 	else
 	{
 		printk("current_conn is NULL — skipping notify\n");
+	}
+
+	if (conn)
+	{
+		bt_conn_unref(conn);
 	}
 
 	/* Expected interval: 14 ms (29 samples / 2000 Hz = 14.5 ms) */

@@ -89,8 +89,10 @@ These are **custom 128-bit UUIDs** (not the standard Bluetooth SIG 0x1800
 Generic Access). The characteristic supports **notify only** (no read/write).
 
 A client enables notifications by writing `0x0001` to the characteristic's
-**CCCD** (Client Characteristic Configuration Descriptor). The firmware logs
-`sEMG notifications enabled` when this happens.
+**CCCD** (Client Characteristic Configuration Descriptor). The CCCD requires an
+encrypted BLE link, and the firmware requests `BT_SECURITY_L2` as soon as a
+central connects. If the link is not encrypted, the subscribe write is rejected
+and sEMG notifications stay disabled.
 
 Two standard 16-bit services are also present (inherited from the original
 Zephyr sample):
@@ -134,7 +136,7 @@ semg_firmware/
 | `CONFIG_BT_BUF_ACL_RX_SIZE` | 251 | Symmetric with TX for MTU exchange |
 | `CONFIG_BT_GATT_CLIENT` | y | Lets the peripheral initiate `bt_gatt_exchange_mtu()` |
 | `CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE` | 2048 | `bt_gatt_notify` call chain needs headroom |
-| `CONFIG_BT_SMP` | y | Security Manager Protocol (pairing support) |
+| `CONFIG_BT_SMP` | y | Security Manager Protocol; required for encrypted notification subscription |
 
 The central **must** request an ATT MTU of at least 185 during the MTU
 exchange, or the 182-byte notification will fail. Most modern BLE centrals
@@ -163,9 +165,10 @@ Advertising successfully started
 1. Open nRF Connect, scan for **"sEMG Sensor"**, and connect.
 2. The app will auto-negotiate MTU (verify it's >= 243 in the connection info).
 3. Find the **Unknown Service** with UUID `00001800-b5a3-f393-...`.
-4. Tap the triple-down-arrow on the characteristic to enable notifications.
-5. You should see 182-byte payloads arriving every ~14-15 ms.
-6. On the serial console you'll see timing logs:
+4. Pair or accept the BLE security prompt if the central asks for it.
+5. Tap the triple-down-arrow on the characteristic to enable notifications.
+6. You should see 182-byte payloads arriving every ~14-15 ms.
+7. On the serial console you'll see timing logs:
    ```
    sEMG pkt #1  dt=15 ms (expect ~14)
    sEMG pkt #2  dt=14 ms (expect ~14)
